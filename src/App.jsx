@@ -1,6 +1,9 @@
 import { useState, useEffect, useRef } from 'react'
 import { usePrivy, useLoginWithEmail } from '@privy-io/react-auth'
 import { useWallets, useCreateWallet } from '@privy-io/react-auth/solana'
+import { createSolanaRpc, address } from '@solana/kit'
+
+const rpc = createSolanaRpc('https://api.devnet.solana.com')
 
 function App() {
   const { ready, authenticated, user, logout } = usePrivy()
@@ -13,6 +16,16 @@ function App() {
     (account) => account.type === 'wallet' && account.chainType === 'solana'
   )
   const creatingRef = useRef(false)
+  const [balance, setBalance] = useState(null)
+  const [refresh, setRefresh] = useState(0)
+
+  useEffect(() => {
+    if (!solanaAccount) return
+    rpc.getBalance(address(solanaAccount.address))
+      .send()
+      .then(({ value }) => setBalance(Number(value) / 1_000_000_000))
+      .catch((err) => console.error('balance fetch failed:', err))
+  }, [solanaAccount, refresh])
 
   useEffect(() => {
     if (!authenticated || !walletsReady || solanaAccount || creatingRef.current) return
@@ -30,6 +43,22 @@ function App() {
         <h1>Welcome to Mayu</h1>
         <p>Your Solana wallet:</p>
         <p>{solanaAccount?.address ?? 'Creating your wallet...'}</p>
+        <p>Balance: {balance === null ? 'loading...' : `${balance} SOL`}</p>
+        <button
+          onClick={async () => {
+            try {
+              await rpc
+                .requestAirdrop(address(solanaAccount.address), 1_000_000_000n)
+                .send()
+              setTimeout(() => setRefresh((n) => n + 1), 2000)
+            } catch (err) {
+              console.error('airdrop failed:', err)
+            }
+          }}
+        >
+          Get 1 devnet SOL
+        </button>
+        <button onClick={() => setRefresh((n) => n + 1)}>Refresh balance</button>
         <button onClick={logout}>Log out</button>
       </div>
     )
