@@ -14,6 +14,7 @@ import {
 } from '@solana-program/token'
 
 const rpc = createSolanaRpc('https://api.devnet.solana.com')
+const MAYU_MINT = address('FXpWnihk17THTFfwt4kQaX4xMhTetSwzZmSTjNhEwpAT')
 
 function App() {
   const { ready, authenticated, user, logout } = usePrivy()
@@ -117,6 +118,26 @@ function App() {
     }
   }
 
+  const [mayuBalance, setMayuBalance] = useState(null)
+
+  useEffect(() => {
+    if (!solanaAccount) return
+    const fetchMayu = async () => {
+      try {
+        const [ata] = await findAssociatedTokenPda({
+          mint: MAYU_MINT,
+          owner: address(solanaAccount.address),
+          tokenProgram: TOKEN_PROGRAM_ADDRESS,
+        })
+        const { value } = await rpc.getTokenAccountBalance(ata).send()
+        setMayuBalance(value.uiAmount)
+      } catch (err) {
+        setMayuBalance(0)
+      }
+    }
+    fetchMayu()
+  }, [solanaAccount, refresh])
+
   if (!ready) return <p>Loading...</p>
 
   if (authenticated) {
@@ -126,6 +147,7 @@ function App() {
         <p>Your Solana wallet:</p>
         <p>{solanaAccount?.address ?? 'Creating your wallet...'}</p>
         <p>Balance: {balance === null ? 'loading...' : `${balance} SOL`}</p>
+        <p>Balance: {mayuBalance === null ? 'loading...' : `${mayuBalance} MAYU`}</p>
         <button
           onClick={async () => {
             try {
