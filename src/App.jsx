@@ -147,9 +147,7 @@ function App() {
   const overBalance = validAmount && balance !== null && amountNum > balance
 
   // ----- transaction ceremony (shared shape) -----
-  const sendInstructions = async (instructions) => {
-    const owner = address(solanaAccount.address)
-    const ownerSigner = createNoopSigner(owner)
+    const sendInstructions = async (instructions, ownerSigner) => {
     const { value: latestBlockhash } = await rpc.getLatestBlockhash().send()
     const message = pipe(
       createTransactionMessage({ version: 0 }),
@@ -210,7 +208,7 @@ function App() {
           authority: pool,
           amount: mayuOutBase,
         }),
-      ])
+      ], ownerSigner)
 
       setLastSwap({ sol: pendingSwap.solIn, mayu: pendingSwap.mayuOut })
       setSwapAmount('')
@@ -257,7 +255,7 @@ function App() {
           source: userAta, destination: poolAta, authority: ownerSigner,
           amount: 16_534_000_000n,
         }),
-      ])
+      ], ownerSigner)
       console.log('pool seeded!')
       setTimeout(() => setRefresh((n) => n + 1), 2000)
     } catch (err) {
@@ -292,7 +290,7 @@ function App() {
           mint: mint.address, token: ata, mintAuthority: ownerSigner,
           amount: 1_000_000n * 10n ** 9n,
         }),
-      ])
+      ], ownerSigner)
       console.log('minted new token:', mint.address)
     } catch (err) {
       console.error('mint failed:', err)
