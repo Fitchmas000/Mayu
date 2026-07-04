@@ -6,15 +6,25 @@ import {
   createTransactionMessage, setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash, appendTransactionMessageInstructions,
   partiallySignTransactionMessageWithSigners, getTransactionEncoder, getBase58Decoder,
+  createKeyPairSignerFromPrivateKeyBytes,
 } from '@solana/kit'
-import { getCreateAccountInstruction } from '@solana-program/system'
+import { getCreateAccountInstruction, getTransferSolInstruction } from '@solana-program/system'
 import {
   TOKEN_PROGRAM_ADDRESS, getMintSize, getInitializeMintInstruction,
   findAssociatedTokenPda, getCreateAssociatedTokenInstruction, getMintToInstruction,
+  getCreateAssociatedTokenIdempotentInstruction, getTransferInstruction,
 } from '@solana-program/token'
 
 const rpc = createSolanaRpc('https://api.devnet.solana.com')
 const MAYU_MINT = address('FXpWnihk17THTFfwt4kQaX4xMhTetSwzZmSTjNhEwpAT')
+
+
+function getQuote(amountIn, reserveIn, reserveOut) {
+  const k = reserveIn * reserveOut
+  const newReserveIn = reserveIn + amountIn
+  const newReserveOut = k / newReserveIn
+  return reserveOut - newReserveOut
+}
 
 function App() {
   const { ready, authenticated, user, logout } = usePrivy()
@@ -31,6 +41,38 @@ function App() {
   const [refresh, setRefresh] = useState(0)
   const { signAndSendTransaction } = useSignAndSendTransaction()
   const [mintAddress, setMintAddress] = useState(null)
+  const [swapAmount, setSwapAmount] = useState('')
+  const [poolSol, setPoolSol] = useState(null)
+  const [poolMayu, setPoolMayu] = useState(null)
+
+  const [pool, setPool] = useState(null)
+
+  useEffect(() => {
+    const secret = import.meta.env.VITE_POOL_SECRET
+    if (!secret) return
+    const bytes = new Uint8Array(secret.match(/.{2}/g).map((h) => parseInt(h, 16)))
+    createKeyPairSignerFromPrivateKeyBytes(bytes).then(setPool)
+  }, [])
+
+  useEffect(() => {
+    if (!pool) return
+    const fetchReserves = async () => {
+      const { value: lamports } = await rpc.getBalance(pool.address).send()
+      setPoolSol(Number(lamports) / 1_000_000_000)
+      try {
+        const [poolAta] = await findAssociatedTokenPda({
+          mint: MAYU_MINT,
+          owner: pool.address,
+          tokenProgram: TOKEN_PROGRAM_ADDRESS,
+        })
+        const { value } = await rpc.getTokenAccountBalance(poolAta).send()
+        setPoolMayu(value.uiAmount)
+      } catch {
+        setPoolMayu(0)
+      }
+    }
+    fetchReserves()
+  }, [pool, refresh])
 
   useEffect(() => {
     if (!solanaAccount) return
@@ -138,6 +180,61 @@ function App() {
     fetchMayu()
   }, [solanaAccount, refresh])
 
+  const seedPool = async () => {
+    try {
+      const owner = address(solanaAccount.address)
+      const ownerSigner = createNoopSigner(owner)
+
+      const [userAta] = await findAssociatedTokenPda({
+        mint: MAYU_MINT, owner, tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      })
+      const [poolAta] = await findAssociatedTokenPda({
+        mint: MAYU_MINT, owner: pool.address, tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      })
+
+      const instructions = [
+        getTransferSolInstruction({
+          source: ownerSigner,
+          destination: pool.address,
+          amount: 2_000_000n,
+        }),
+        getCreateAssociatedTokenIdempotentInstruction({
+          payer: ownerSigner,
+          ata: poolAta,
+          owner: pool.address,
+          mint: MAYU_MINT,
+        }),
+        getTransferInstruction({
+          source: userAta,
+          destination: poolAta,
+          authority: ownerSigner,
+          amount: 16_534_000_000n,
+        }),
+      ]
+
+      const { value: latestBlockhash } = await rpc.getLatestBlockhash().send()
+      const message = pipe(
+        createTransactionMessage({ version: 0 }),
+        (m) => setTransactionMessageFeePayerSigner(ownerSigner, m),
+        (m) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
+        (m) => appendTransactionMessageInstructions(instructions, m),
+      )
+      const partiallySigned = await partiallySignTransactionMessageWithSigners(message)
+      const txBytes = getTransactionEncoder().encode(partiallySigned)
+
+      await signAndSendTransaction({
+        transaction: new Uint8Array(txBytes),
+        wallet: wallets[0],
+        chain: 'solana:devnet',
+      })
+
+      console.log('pool seeded!')
+      setTimeout(() => setRefresh((n) => n + 1), 2000)
+    } catch (err) {
+      console.error('seed failed:', err)
+    }
+  }
+
   if (!ready) return <p>Loading...</p>
 
   if (authenticated) {
@@ -148,6 +245,18 @@ function App() {
         <p>{solanaAccount?.address ?? 'Creating your wallet...'}</p>
         <p>Balance: {balance === null ? 'loading...' : `${balance} SOL`}</p>
         <p>Balance: {mayuBalance === null ? 'loading...' : `${mayuBalance} MAYU`}</p>
+        <h2>Swap</h2>
+        <input
+          placeholder="SOL amount"
+          value={swapAmount}
+          onChange={(e) => setSwapAmount(e.target.value)}
+        />
+        <p>
+          {poolSol > 0 && poolMayu > 0 && swapAmount > 0
+            ? `≈ ${getQuote(Number(swapAmount), poolSol, poolMayu).toFixed(2)} MAYU`
+            : 'Pool is empty'}
+        </p>
+        <p>Pool: {poolSol ?? '...'} SOL / {poolMayu ?? '...'} MAYU</p>
         <button
           onClick={async () => {
             try {
@@ -163,8 +272,7 @@ function App() {
           Get 1 devnet SOL
         </button>
         <button onClick={() => setRefresh((n) => n + 1)}>Refresh balance</button>
-        <button onClick={mintMayu}>Mint Mayu</button>
-        {mintAddress && <p>Mayu mint: {mintAddress}</p>}
+        <button onClick={seedPool}>Seed pool</button>
         <button onClick={logout}>Log out</button>
       </div>
     )
