@@ -1,7 +1,17 @@
 import { useState, useEffect, useRef } from 'react'
 import { usePrivy, useLoginWithEmail } from '@privy-io/react-auth'
-import { useWallets, useCreateWallet } from '@privy-io/react-auth/solana'
-import { createSolanaRpc, address } from '@solana/kit'
+import { useWallets, useCreateWallet, useSignAndSendTransaction } from '@privy-io/react-auth/solana'
+import {
+  createSolanaRpc, address, pipe, generateKeyPairSigner, createNoopSigner,
+  createTransactionMessage, setTransactionMessageFeePayerSigner,
+  setTransactionMessageLifetimeUsingBlockhash, appendTransactionMessageInstructions,
+  partiallySignTransactionMessageWithSigners, getTransactionEncoder, getBase58Decoder,
+} from '@solana/kit'
+import { getCreateAccountInstruction } from '@solana-program/system'
+import {
+  TOKEN_PROGRAM_ADDRESS, getMintSize, getInitializeMintInstruction,
+  findAssociatedTokenPda, getCreateAssociatedTokenInstruction, getMintToInstruction,
+} from '@solana-program/token'
 
 const rpc = createSolanaRpc('https://api.devnet.solana.com')
 
@@ -18,6 +28,8 @@ function App() {
   const creatingRef = useRef(false)
   const [balance, setBalance] = useState(null)
   const [refresh, setRefresh] = useState(0)
+  const { signAndSendTransaction } = useSignAndSendTransaction()
+  const [mintAddress, setMintAddress] = useState(null)
 
   useEffect(() => {
     if (!solanaAccount) return
@@ -34,6 +46,76 @@ function App() {
       .then(({ wallet }) => console.log('auto-created:', wallet))
       .catch((err) => console.error('auto-create failed:', err))
   }, [authenticated, walletsReady, solanaAccount])
+
+  const mintMayu = async () => {
+    try {
+      const owner = address(solanaAccount.address)
+      const ownerSigner = createNoopSigner(owner)
+      const mint = await generateKeyPairSigner()
+
+      const space = BigInt(getMintSize())
+      const rent = await rpc
+        .getMinimumBalanceForRentExemption(space)
+        .send()
+
+      const [ata] = await findAssociatedTokenPda({
+        mint: mint.address,
+        owner,
+        tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      })
+
+      const instructions = [
+        getCreateAccountInstruction({
+          payer: ownerSigner,
+          newAccount: mint,
+          lamports: rent,
+          space,
+          programAddress: TOKEN_PROGRAM_ADDRESS,
+        }),
+        getInitializeMintInstruction({
+          mint: mint.address,
+          decimals: 9,
+          mintAuthority: owner,
+        }),
+        getCreateAssociatedTokenInstruction({
+          payer: ownerSigner,
+          ata,
+          owner,
+          mint: mint.address,
+        }),
+        getMintToInstruction({
+          mint: mint.address,
+          token: ata,
+          mintAuthority: ownerSigner,
+          amount: 1_000_000n * 10n ** 9n,
+        }),
+      ]
+
+      const { value: latestBlockhash } = await rpc.getLatestBlockhash().send()
+
+      const message = pipe(
+        createTransactionMessage({ version: 0 }),
+        (m) => setTransactionMessageFeePayerSigner(ownerSigner, m),
+        (m) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
+        (m) => appendTransactionMessageInstructions(instructions, m),
+      )
+
+      const partiallySigned = await partiallySignTransactionMessageWithSigners(message)
+      const txBytes = getTransactionEncoder().encode(partiallySigned)
+
+      const { signature } = await signAndSendTransaction({
+        transaction: new Uint8Array(txBytes),
+        wallet: wallets[0],
+        chain: 'solana:devnet',
+      })
+
+      console.log('Mayu minted! signature:', getBase58Decoder().decode(signature))
+      setMintAddress(mint.address)
+      setTimeout(() => setRefresh((n) => n + 1), 2000)
+    } catch (err) {
+      console.error('mint failed:', err)
+    }
+  }
 
   if (!ready) return <p>Loading...</p>
 
@@ -59,6 +141,8 @@ function App() {
           Get 1 devnet SOL
         </button>
         <button onClick={() => setRefresh((n) => n + 1)}>Refresh balance</button>
+        <button onClick={mintMayu}>Mint Mayu</button>
+        {mintAddress && <p>Mayu mint: {mintAddress}</p>}
         <button onClick={logout}>Log out</button>
       </div>
     )
