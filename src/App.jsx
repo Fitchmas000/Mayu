@@ -235,6 +235,64 @@ function App() {
     }
   }
 
+  const executeSwap = async () => {
+    try {
+      if (!pool || !poolSol || !poolMayu) return
+      const amountIn = Number(swapAmount)
+      if (!amountIn || amountIn <= 0) return
+
+      const owner = address(solanaAccount.address)
+      const ownerSigner = createNoopSigner(owner)
+
+      const lamportsIn = BigInt(Math.round(amountIn * 1_000_000_000))
+      const mayuOut = getQuote(amountIn, poolSol, poolMayu)
+      const mayuOutBase = BigInt(Math.floor(mayuOut * 1_000_000_000))
+
+      const [userAta] = await findAssociatedTokenPda({
+        mint: MAYU_MINT, owner, tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      })
+      const [poolAta] = await findAssociatedTokenPda({
+        mint: MAYU_MINT, owner: pool.address, tokenProgram: TOKEN_PROGRAM_ADDRESS,
+      })
+
+      const instructions = [
+        getTransferSolInstruction({
+          source: ownerSigner,
+          destination: pool.address,
+          amount: lamportsIn,
+        }),
+        getTransferInstruction({
+          source: poolAta,
+          destination: userAta,
+          authority: pool,
+          amount: mayuOutBase,
+        }),
+      ]
+
+      const { value: latestBlockhash } = await rpc.getLatestBlockhash().send()
+      const message = pipe(
+        createTransactionMessage({ version: 0 }),
+        (m) => setTransactionMessageFeePayerSigner(ownerSigner, m),
+        (m) => setTransactionMessageLifetimeUsingBlockhash(latestBlockhash, m),
+        (m) => appendTransactionMessageInstructions(instructions, m),
+      )
+      const partiallySigned = await partiallySignTransactionMessageWithSigners(message)
+      const txBytes = getTransactionEncoder().encode(partiallySigned)
+
+      await signAndSendTransaction({
+        transaction: new Uint8Array(txBytes),
+        wallet: wallets[0],
+        chain: 'solana:devnet',
+      })
+
+      console.log(`swapped ${amountIn} SOL for ${mayuOut} MAYU`)
+      setSwapAmount('')
+      setTimeout(() => setRefresh((n) => n + 1), 2000)
+    } catch (err) {
+      console.error('swap failed:', err)
+    }
+  }
+
   if (!ready) return <p>Loading...</p>
 
   if (authenticated) {
@@ -273,6 +331,7 @@ function App() {
         </button>
         <button onClick={() => setRefresh((n) => n + 1)}>Refresh balance</button>
         <button onClick={seedPool}>Seed pool</button>
+        <button onClick={executeSwap}>Swap</button>
         <button onClick={logout}>Log out</button>
       </div>
     )
