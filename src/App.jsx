@@ -33,6 +33,10 @@ function getQuote(amountIn, reserveIn, reserveOut) {
 const usd = (n) =>
   n.toLocaleString('en-US', { style: 'currency', currency: 'USD' })
 
+// SOL amounts are small on devnet, MAYU amounts are big — format each sensibly.
+const fmtAmt = (n, symbol) =>
+  symbol === 'SOL' ? n.toFixed(4) : n.toFixed(2)
+
 function App() {
   const { ready, authenticated, user, logout } = usePrivy()
   const [email, setEmail] = useState('')
@@ -57,6 +61,7 @@ function App() {
 
   // UI state
   const [view, setView] = useState('home') // 'home' | 'swap' | 'confirm' | 'receive'
+  const [direction, setDirection] = useState('buy') // 'buy' = SOL→MAYU, 'sell' = MAYU→SOL
   const [swapAmount, setSwapAmount] = useState('')
   const [pendingSwap, setPendingSwap] = useState(null)
   const [status, setStatus] = useState({ text: '', error: false })
@@ -134,20 +139,47 @@ function App() {
   const mayuUsd = poolSol > 0 && poolMayu > 0 ? (poolSol / poolMayu) * SOL_USD : 0
   const totalUsd = (balance ?? 0) * SOL_USD + (mayuBalance ?? 0) * mayuUsd
 
+  // Everything below flips with direction. 'buy' pays SOL, 'sell' pays MAYU.
+  const paySymbol = direction === 'buy' ? 'SOL' : 'MAYU'
+  const getSymbol = direction === 'buy' ? 'MAYU' : 'SOL'
+  const payBalance = direction === 'buy' ? balance : mayuBalance
+  const payUsdRate = direction === 'buy' ? SOL_USD : mayuUsd
+
   const amountNum = Number(swapAmount)
   const validAmount =
     swapAmount !== '' && !Number.isNaN(amountNum) && amountNum > 0
   const quote =
     validAmount && poolSol > 0 && poolMayu > 0
-      ? getQuote(amountNum, poolSol, poolMayu)
+      ? direction === 'buy'
+        ? getQuote(amountNum, poolSol, poolMayu)
+        : getQuote(amountNum, poolMayu, poolSol)
       : 0
-  const spotRate = poolSol > 0 && poolMayu > 0 ? poolMayu / poolSol : 0
+  const spotOutPerIn =
+    poolSol > 0 && poolMayu > 0
+      ? direction === 'buy'
+        ? poolMayu / poolSol
+        : poolSol / poolMayu
+      : 0
   const priceImpact =
-    validAmount && quote > 0 ? (1 - quote / amountNum / spotRate) * 100 : 0
-  const overBalance = validAmount && balance !== null && amountNum > balance
+    validAmount && quote > 0 && spotOutPerIn > 0
+      ? (1 - quote / amountNum / spotOutPerIn) * 100
+      : 0
+  const overBalance = validAmount && payBalance !== null && amountNum > payBalance
+
+  const flipDirection = () => {
+    setDirection((d) => (d === 'buy' ? 'sell' : 'buy'))
+    setSwapAmount('')
+  }
+
+  const setMax = () => {
+    if (payBalance === null) return
+    // Fees are always paid in SOL, so only the SOL side needs a buffer.
+    const max = direction === 'buy' ? Math.max(payBalance - 0.0005, 0) : payBalance
+    setSwapAmount(String(max))
+  }
 
   // ----- transaction ceremony (shared shape) -----
-    const sendInstructions = async (instructions, ownerSigner) => {
+  const sendInstructions = async (instructions, ownerSigner) => {
     const { value: latestBlockhash } = await rpc.getLatestBlockhash().send()
     const message = pipe(
       createTransactionMessage({ version: 0 }),
@@ -168,16 +200,21 @@ function App() {
   const reviewSwap = () => {
     if (!validAmount || overBalance || quote <= 0) return
     setPendingSwap({
-      solIn: amountNum,
-      mayuOut: quote,
+      direction,
+      paySymbol,
+      getSymbol,
+      amountIn: amountNum,
+      amountOut: quote,
       minOut: quote * (1 - SLIPPAGE),
-      rate: quote / amountNum,
+      // Rate is always shown as MAYU per SOL, whichever way the trade goes.
+      rateMayuPerSol: direction === 'buy' ? quote / amountNum : amountNum / quote,
+      usdCost: amountNum * payUsdRate,
     })
     setStatus({ text: '', error: false })
     setView('confirm')
   }
 
-  // ----- swap: execute step -----
+  // ----- swap: execute step (both directions) -----
   const executeSwap = async () => {
     if (!pendingSwap || !pool) return
     setBusy(true)
@@ -186,8 +223,8 @@ function App() {
       const owner = address(solanaAccount.address)
       const ownerSigner = createNoopSigner(owner)
 
-      const lamportsIn = BigInt(Math.round(pendingSwap.solIn * 1_000_000_000))
-      const mayuOutBase = BigInt(Math.floor(pendingSwap.mayuOut * 1_000_000_000))
+      const inBase = BigInt(Math.round(pendingSwap.amountIn * 1_000_000_000))
+      const outBase = BigInt(Math.floor(pendingSwap.amountOut * 1_000_000_000))
 
       const [userAta] = await findAssociatedTokenPda({
         mint: MAYU_MINT, owner, tokenProgram: TOKEN_PROGRAM_ADDRESS,
@@ -196,21 +233,45 @@ function App() {
         mint: MAYU_MINT, owner: pool.address, tokenProgram: TOKEN_PROGRAM_ADDRESS,
       })
 
-      await sendInstructions([
-        getTransferSolInstruction({
-          source: ownerSigner,
-          destination: pool.address,
-          amount: lamportsIn,
-        }),
-        getTransferInstruction({
-          source: poolAta,
-          destination: userAta,
-          authority: pool,
-          amount: mayuOutBase,
-        }),
-      ], ownerSigner)
+      const instructions =
+        pendingSwap.direction === 'buy'
+          ? [
+              // User pays SOL in; pool pays MAYU out (pool signs the token leg).
+              getTransferSolInstruction({
+                source: ownerSigner,
+                destination: pool.address,
+                amount: inBase,
+              }),
+              getTransferInstruction({
+                source: poolAta,
+                destination: userAta,
+                authority: pool,
+                amount: outBase,
+              }),
+            ]
+          : [
+              // User pays MAYU in; pool pays SOL out (pool signs the SOL leg).
+              getTransferInstruction({
+                source: userAta,
+                destination: poolAta,
+                authority: ownerSigner,
+                amount: inBase,
+              }),
+              getTransferSolInstruction({
+                source: pool,
+                destination: owner,
+                amount: outBase,
+              }),
+            ]
 
-      setLastSwap({ sol: pendingSwap.solIn, mayu: pendingSwap.mayuOut })
+      await sendInstructions(instructions, ownerSigner)
+
+      setLastSwap({
+        amountIn: pendingSwap.amountIn,
+        amountOut: pendingSwap.amountOut,
+        paySymbol: pendingSwap.paySymbol,
+        getSymbol: pendingSwap.getSymbol,
+      })
       setSwapAmount('')
       setPendingSwap(null)
       setStatus({ text: '', error: false })
@@ -385,30 +446,45 @@ function App() {
               value={swapAmount}
               onChange={(e) => setSwapAmount(e.target.value)}
             />
-            <span className="token">SOL</span>
+            <span className="token">{paySymbol}</span>
           </div>
           <div className="detail-line">
             <span className="k">
-              {validAmount ? `≈ ${usd(amountNum * SOL_USD)}` : '\u00a0'}
+              {validAmount ? `≈ ${usd(amountNum * payUsdRate)}` : '\u00a0'}
             </span>
-            <button
-              className="max-link"
-              onClick={() => balance && setSwapAmount(String(Math.max(balance - 0.0005, 0)))}
-            >
-              Max {balance !== null ? balance.toFixed(4) : '...'}
+            <button className="max-link" onClick={setMax}>
+              Max {payBalance !== null ? fmtAmt(payBalance, paySymbol) : '...'}
             </button>
           </div>
         </div>
 
-        <div className="swap-arrow">↓</div>
+        <button
+          onClick={flipDirection}
+          title="Switch direction"
+          style={{
+            display: 'block',
+            margin: '6px auto',
+            width: '34px',
+            height: '34px',
+            borderRadius: '50%',
+            border: '1px solid var(--line-strong)',
+            background: 'var(--card)',
+            color: 'var(--teal-600)',
+            fontSize: '16px',
+            cursor: 'pointer',
+            lineHeight: 1,
+          }}
+        >
+          ⇅
+        </button>
 
         <div className="swap-panel receive-panel">
           <div className="label">You get</div>
           <div className="row">
             <span className="big-out">
-              {quote > 0 ? `≈ ${quote.toFixed(2)}` : '—'}
+              {quote > 0 ? `≈ ${fmtAmt(quote, getSymbol)}` : '—'}
             </span>
-            <span className="token">MAYU</span>
+            <span className="token">{getSymbol}</span>
           </div>
           <div className="detail-line">
             <span className="k">
@@ -429,7 +505,7 @@ function App() {
         </div>
 
         {overBalance && (
-          <div className="warn-box">That's more SOL than you have.</div>
+          <div className="warn-box">That's more {paySymbol} than you have.</div>
         )}
 
         <button
@@ -454,17 +530,23 @@ function App() {
 
         <div className="confirm-summary">
           <div className="sub">You pay</div>
-          <div className="big">{pendingSwap.solIn} SOL</div>
+          <div className="big">
+            {pendingSwap.amountIn} {pendingSwap.paySymbol}
+          </div>
           <div style={{ margin: '6px 0', color: 'var(--ink-faint)' }}>↓</div>
           <div className="sub">You get at least</div>
-          <div className="big get">{pendingSwap.minOut.toFixed(2)} MAYU</div>
+          <div className="big get">
+            {fmtAmt(pendingSwap.minOut, pendingSwap.getSymbol)} {pendingSwap.getSymbol}
+          </div>
         </div>
 
         <div className="divider" />
 
         <div className="detail-line">
           <span className="k">Rate</span>
-          <span className="v">1 SOL ≈ {Math.round(pendingSwap.rate).toLocaleString()} MAYU</span>
+          <span className="v">
+            1 SOL ≈ {Math.round(pendingSwap.rateMayuPerSol).toLocaleString()} MAYU
+          </span>
         </div>
         <div className="detail-line">
           <span className="k">Slippage limit</span>
@@ -472,12 +554,13 @@ function App() {
         </div>
         <div className="detail-line">
           <span className="k">Total cost</span>
-          <span className="v">≈ {usd(pendingSwap.solIn * SOL_USD)}</span>
+          <span className="v">≈ {usd(pendingSwap.usdCost)}</span>
         </div>
 
         <div className="warn-box">
           Prices move with the market. You'll never receive less than{' '}
-          {pendingSwap.minOut.toFixed(2)} MAYU or the swap cancels.
+          {fmtAmt(pendingSwap.minOut, pendingSwap.getSymbol)} {pendingSwap.getSymbol} or
+          the swap cancels.
         </div>
 
         <button className="btn btn-primary" disabled={busy} onClick={executeSwap}>
@@ -531,8 +614,11 @@ function App() {
         <div className="txn-list">
           <div className="title">Recent</div>
           <div className="txn-row">
-            <span className="what">Swapped {lastSwap.sol} SOL → MAYU</span>
-            <span>+{lastSwap.mayu.toFixed(2)}</span>
+            <span className="what">
+              Swapped {fmtAmt(lastSwap.amountIn, lastSwap.paySymbol)} {lastSwap.paySymbol} →{' '}
+              {lastSwap.getSymbol}
+            </span>
+            <span>+{fmtAmt(lastSwap.amountOut, lastSwap.getSymbol)}</span>
           </div>
         </div>
       )}
