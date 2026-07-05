@@ -1,12 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
 import { usePrivy, useLoginWithEmail } from '@privy-io/react-auth'
-import { useWallets, useCreateWallet, useSignAndSendTransaction } from '@privy-io/react-auth/solana'
+import { useWallets, useCreateWallet, useSignAndSendTransaction, useSignMessage } from '@privy-io/react-auth/solana'
 import {
   createSolanaRpc, address, pipe, generateKeyPairSigner, createNoopSigner,
   createTransactionMessage, setTransactionMessageFeePayerSigner,
   setTransactionMessageLifetimeUsingBlockhash, appendTransactionMessageInstructions,
   partiallySignTransactionMessageWithSigners, getTransactionEncoder, getBase58Decoder,
-  createKeyPairSignerFromPrivateKeyBytes,
+  createKeyPairSignerFromPrivateKeyBytes, getProgramDerivedAddress, getAddressEncoder,
+  getBase64EncodedWireTransaction
 } from '@solana/kit'
 import { getCreateAccountInstruction, getTransferSolInstruction } from '@solana-program/system'
 import {
@@ -14,6 +15,7 @@ import {
   findAssociatedTokenPda, getCreateAssociatedTokenInstruction, getMintToInstruction,
   getCreateAssociatedTokenIdempotentInstruction, getTransferInstruction,
 } from '@solana-program/token'
+import { getCreateMetadataAccountV3Instruction, TOKEN_METADATA_PROGRAM_ADDRESS } from 'gill/programs'
 
 const rpc = createSolanaRpc('https://api.devnet.solana.com')
 const MAYU_MINT = address('FXpWnihk17THTFfwt4kQaX4xMhTetSwzZmSTjNhEwpAT')
@@ -58,6 +60,7 @@ function App() {
   const [pool, setPool] = useState(null)
   const [poolSol, setPoolSol] = useState(null)
   const [poolMayu, setPoolMayu] = useState(null)
+  const { signMessage } = useSignMessage()
 
   // UI state
   const [view, setView] = useState('home') // 'home' | 'swap' | 'confirm' | 'receive'
@@ -68,7 +71,6 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [lastSwap, setLastSwap] = useState(null)
-
   // ----- load the pool signer from env -----
   useEffect(() => {
     const secret = import.meta.env.VITE_POOL_SECRET
@@ -179,7 +181,7 @@ function App() {
   }
 
   // ----- transaction ceremony (shared shape) -----
-  const sendInstructions = async (instructions, ownerSigner) => {
+  const simulateInstructions = async (instructions, ownerSigner) => {
     const { value: latestBlockhash } = await rpc.getLatestBlockhash().send()
     const message = pipe(
       createTransactionMessage({ version: 0 }),
@@ -188,12 +190,16 @@ function App() {
       (m) => appendTransactionMessageInstructions(instructions, m),
     )
     const partiallySigned = await partiallySignTransactionMessageWithSigners(message)
-    const txBytes = getTransactionEncoder().encode(partiallySigned)
-    return signAndSendTransaction({
-      transaction: new Uint8Array(txBytes),
-      wallet: wallets[0],
-      chain: 'solana:devnet',
-    })
+    const wireTx = getBase64EncodedWireTransaction(partiallySigned)
+    const { value } = await rpc
+      .simulateTransaction(wireTx, {
+        encoding: 'base64',
+        sigVerify: false,
+        replaceRecentBlockhash: true,
+      })
+      .send()
+    console.log('simulation error:', value.err)
+    console.log('simulation logs:', value.logs)
   }
 
   // ----- swap: review step -----
@@ -321,6 +327,44 @@ function App() {
       setTimeout(() => setRefresh((n) => n + 1), 2000)
     } catch (err) {
       console.error('seed failed:', err)
+    }
+  }
+
+  const addMetadata = async () => {
+    try {
+      const owner = address(solanaAccount.address)
+      const ownerSigner = createNoopSigner(owner)
+
+      const enc = getAddressEncoder()
+      const [metadataPda] = await getProgramDerivedAddress({
+        programAddress: TOKEN_METADATA_PROGRAM_ADDRESS,
+        seeds: ['metadata', enc.encode(TOKEN_METADATA_PROGRAM_ADDRESS), enc.encode(MAYU_MINT)],
+      })
+
+      await sendInstructions([
+        getCreateMetadataAccountV3Instruction({
+          metadata: metadataPda,
+          mint: MAYU_MINT,
+          mintAuthority: ownerSigner,
+          payer: ownerSigner,
+          updateAuthority: ownerSigner,
+          data: {
+            name: 'Mayu',
+            symbol: 'MAYU',
+            uri: 'https://raw.githubusercontent.com/Fitchmas000/Mayu/main/assets/mayu-metadata.json',
+            sellerFeeBasisPoints: 0,
+            creators: null,
+            collection: null,
+            uses: null,
+          },
+          isMutable: true,
+          collectionDetails: null,
+        }),
+      ], ownerSigner)
+
+      console.log('metadata created!')
+    } catch (err) {
+      console.error('metadata failed:', err)
     }
   }
 
@@ -631,6 +675,7 @@ function App() {
         <button className="btn" onClick={airdrop}>Request 1 devnet SOL</button>
         <button className="btn" onClick={() => setRefresh((n) => n + 1)}>Refresh balances</button>
         <button className="btn" onClick={seedPool}>Seed pool (dev)</button>
+        <button className="btn" onClick={addMetadata}>Add token metadata (dev)</button>
       </details>
     </div>
   )
