@@ -16,7 +16,7 @@ const saveNames = (names) =>
   fs.writeFileSync(DB_FILE, JSON.stringify(names, null, 2))
 
 const NAME_RULES = /^[a-z0-9_]{3,20}$/
-const RESERVED = ['mason', 'masonfitch', 'simplynum', 'simplynumnum', 'admin', 'support', 'help']
+const RESERVED = ['mason', 'masonfitch', 'simplynumnum', 'admin', 'support', 'help']
 
 app.get('/health', (req, res) => {
   res.json({ ok: true })
@@ -66,6 +66,13 @@ app.post('/claim', (req, res) => {
   names[name] = address
   saveNames(names)
   res.json({ name, address })
+})
+
+app.get('/whois/:address', (req, res) => {
+  const names = loadNames()
+  const entry = Object.entries(names).find(([, addr]) => addr === req.params.address)
+  if (!entry) return res.status(404).json({ error: 'No name for this address' })
+  res.json({ name: entry[0], address: req.params.address })
 })
 
 app.get('/resolve/:name', (req, res) => {
