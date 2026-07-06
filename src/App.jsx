@@ -71,6 +71,34 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [copied, setCopied] = useState(false)
   const [lastSwap, setLastSwap] = useState(null)
+
+  const claimName = async (name) => {
+    try {
+      const messageText = `mayu-registry claim: ${name} -> ${solanaAccount.address}`
+      console.log('APP signs:', JSON.stringify(messageText))
+      const { signature } = await signMessage({
+        message: new TextEncoder().encode(messageText),
+        wallet: wallets[0],
+      })
+      const res = await fetch('http://localhost:3001/claim', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name,
+          address: solanaAccount.address,
+          signature: btoa(String.fromCharCode(...signature)),
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error)
+      console.log('claimed:', data)
+      return data
+    } catch (err) {
+      console.error('claim failed:', err)
+      throw err
+    }
+  }
+
   // ----- load the pool signer from env -----
   useEffect(() => {
     const secret = import.meta.env.VITE_POOL_SECRET
@@ -676,6 +704,7 @@ function App() {
         <button className="btn" onClick={() => setRefresh((n) => n + 1)}>Refresh balances</button>
         <button className="btn" onClick={seedPool}>Seed pool (dev)</button>
         <button className="btn" onClick={addMetadata}>Add token metadata (dev)</button>
+        <button className="btn" onClick={() => claimName('mayu')}>Claim @mayu (dev)</button>
       </details>
     </div>
   )
